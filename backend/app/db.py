@@ -44,9 +44,12 @@ CREATE TABLE IF NOT EXISTS ticket_merges (
   added_qty INTEGER NOT NULL,
   watermark_before INTEGER NOT NULL,
   watermark_after INTEGER NOT NULL,
+  parent_qty_before INTEGER NOT NULL DEFAULT 0,
   operator TEXT NOT NULL,
   merged_at TEXT NOT NULL,
-  note TEXT NOT NULL DEFAULT ''
+  note TEXT NOT NULL DEFAULT '',
+  merge_code TEXT NOT NULL DEFAULT '',
+  state TEXT NOT NULL DEFAULT 'committed'
 );
 CREATE TABLE IF NOT EXISTS merge_links (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -56,10 +59,12 @@ CREATE TABLE IF NOT EXISTS merge_links (
   child_status TEXT NOT NULL,
   child_qty INTEGER NOT NULL,
   child_pickup_code TEXT NOT NULL DEFAULT '',
-  merged_at TEXT NOT NULL
+  merged_at TEXT NOT NULL,
+  migrated_qty INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_ticket_items_ticket ON ticket_items(ticket_no);
-CREATE INDEX IF NOT EXISTS idx_merge_links_group ON merge_links(group_id);CREATE TABLE IF NOT EXISTS process_events (
+CREATE INDEX IF NOT EXISTS idx_merge_links_group ON merge_links(group_id);
+CREATE TABLE IF NOT EXISTS process_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ticket_no TEXT NOT NULL,
   from_status TEXT,
@@ -165,6 +170,46 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "UPDATE ticket_items SET origin_ticket_no=ticket_no WHERE origin_ticket_no IS NULL"
         )
+    merge_cols = _columns(conn, "ticket_merges")
+    if "merge_code" not in merge_cols:
+        conn.execute(
+            "ALTER TABLE ticket_merges ADD COLUMN merge_code TEXT NOT NULL DEFAULT ''"
+        )
+        conn.execute(
+            "UPDATE ticket_merges SET merge_code=group_id WHERE merge_code=''"
+        )
+    if "state" not in merge_cols:
+        # 旧库没有世代标记；历史回执按已提交对待，签账时再逐条重放核对。
+        conn.execute(
+            "ALTER TABLE ticket_merges ADD COLUMN state TEXT NOT NULL DEFAULT 'committed'"
+        )
+    if "parent_qty_before" not in merge_cols:
+        # 回执的件数恒等式需要「并入前父票件数」，旧回执用 item_qty-added_qty 回填。
+        conn.execute(
+            "ALTER TABLE ticket_merges ADD COLUMN parent_qty_before INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute(
+            "UPDATE ticket_merges SET parent_qty_before=MAX(item_qty - added_qty, 0)"
+        )
+    link_cols = _columns(conn, "merge_links")
+    if "migrated_qty" not in link_cols:
+        conn.execute(
+            "ALTER TABLE merge_links ADD COLUMN migrated_qty INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute(
+            "UPDATE merge_links SET migrated_qty=child_qty WHERE migrated_qty=0"
+        )
+    # 索引建在列补齐之后，兼容老库。
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ticket_merges_code ON ticket_merges(merge_code)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ticket_items_origin ON ticket_items(origin_ticket_no)"
+    )
+    # 旧实现的「假合并」成功标记不再有裁决权，清掉以免继续骗过只读入口。
+    conn.execute(
+        "DELETE FROM settings WHERE key IN ('merge_surface_last', 'merge_surface_ok')"
+    )
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict | None:

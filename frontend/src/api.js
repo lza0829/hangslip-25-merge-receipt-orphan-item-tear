@@ -34,6 +34,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+  合并码取衣: (merge_code, body = {}) =>
+    req(`/并票/扫码/取衣`, {
+      method: "POST",
+      body: JSON.stringify({ merge_code, ...body }),
+    }),
   隔离: (no, body) =>
     req(`/挂牌/${encodeURIComponent(no)}/隔离`, {
       method: "POST",
@@ -41,6 +46,17 @@ export const api = {
     }),
   并票: (body) => req("/并票", { method: "POST", body: JSON.stringify(body) }),
   并票列表: () => req("/并票"),
+  并票详情: (group_id) =>
+    req(`/并票/${encodeURIComponent(group_id)}`),
+  并票核对: (group_id) =>
+    req(`/并票/${encodeURIComponent(group_id)}/核对`),
+  并票签账: () => req("/并票/核对", { method: "POST", body: "{}" }),
+  件键列表: () => req("/并票/件键"),
+  合并码扫码: (merge_code) =>
+    req("/并票/扫码", {
+      method: "POST",
+      body: JSON.stringify({ merge_code }),
+    }),
   隔离列表: () => req("/隔离"),
   日闸今日: () => req("/日闸/今日"),
   日闸列表: () => req("/日闸"),

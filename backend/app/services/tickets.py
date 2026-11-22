@@ -6,9 +6,77 @@ from fastapi import HTTPException
 
 from app.db import FORWARD, connect, transaction
 from app.services.gate import ensure_day_row, is_day_sealed, refresh_in_flight, today_str
-from app.services.merge import group_pickup_codes
+from app.services.merge import (
+    audit_group,
+    group_merge_codes,
+    group_pickup_codes,
+    resolve_merge_code,
+)
 
 CLOSED = ("已取", "丢失隔离", "已并")
+
+
+def _merge_groups_for(conn, ticket_no: str) -> list[dict]:
+    """该票作为父票的并票世代，带重放核对结论。"""
+    out = []
+    for r in conn.execute(
+        "SELECT * FROM ticket_merges WHERE parent_ticket_no=? ORDER BY merged_at DESC, rowid DESC",
+        (ticket_no,),
+    ).fetchall():
+        audit = audit_group(conn, r)
+        out.append(
+            {
+                "group_id": r["group_id"],
+                "merge_code": r["merge_code"],
+                "state": r["state"],
+                "merge_ok": audit["ok"],
+                "merge_issues": audit["issues"],
+                "child_count": r["child_count"],
+                "added_qty": r["added_qty"],
+            }
+        )
+    return out
+
+
+def _merge_origin_for(conn, ticket_no: str) -> dict | None:
+    """该票作为子票被吞入的世代（退账凭据）。"""
+    link = conn.execute(
+        "SELECT * FROM merge_links WHERE child_ticket_no=?", (ticket_no,)
+    ).fetchone()
+    if not link:
+        return None
+    r = conn.execute(
+        "SELECT * FROM ticket_merges WHERE group_id=?", (link["group_id"],)
+    ).fetchone()
+    audit = audit_group(conn, r) if r else {"ok": False, "issues": ["世代不存在"]}
+    return {
+        "group_id": link["group_id"],
+        "merge_code": r["merge_code"] if r else "",
+        "parent_ticket_no": link["parent_ticket_no"],
+        "child_qty": link["child_qty"],
+        "migrated_qty": link["migrated_qty"],
+        "state": r["state"] if r else "",
+        "merge_ok": audit["ok"],
+        "merge_issues": audit["issues"],
+    }
+
+
+def _attach_merge_surface(conn, row: dict) -> None:
+    """列表/详情同口径：合并码、重放结论、退账来源都从世代派生，不另存标记。"""
+    if row.get("merged_into"):
+        row["merge_origin"] = _merge_origin_for(conn, row["ticket_no"])
+        row["merge_groups"] = []
+        row["merge_ok"] = bool((row["merge_origin"] or {}).get("merge_ok"))
+        row["merge_code"] = (row["merge_origin"] or {}).get("merge_code", "")
+    else:
+        groups = _merge_groups_for(conn, row["ticket_no"])
+        row["merge_groups"] = groups
+        row["merge_origin"] = None
+        row["merge_ok"] = all(g["merge_ok"] for g in groups) if groups else None
+        live = [g for g in groups if g["merge_ok"] and g["state"] == "committed"]
+        row["merge_code"] = live[0]["merge_code"] if live else (
+            groups[0]["merge_code"] if groups else ""
+        )
 
 
 def list_tickets(status: str | None = None, store_code: str | None = None) -> list[dict]:
@@ -41,6 +109,7 @@ def list_tickets(status: str | None = None, store_code: str | None = None) -> li
                     (r["ticket_no"],),
                 ).fetchall()
             ]
+            _attach_merge_surface(conn, r)
         return rows
     finally:
         conn.close()
@@ -85,6 +154,7 @@ def get_ticket(ticket_no: str) -> dict:
                     (data["merged_into"],),
                 ).fetchone()
             )
+        _attach_merge_surface(conn, data)
         return data
     finally:
         conn.close()
@@ -194,10 +264,25 @@ def pickup(ticket_no: str, pickup_code: str, operator: str = "店员") -> dict:
             )
         if row["status"] != "待取":
             raise HTTPException(409, f"仅「待取」可核销，当前「{row['status']}」")
-        # 吞并式并票：只认父票；同组被吞子票的暗码仍可开这一组。
+        # 吞并式并票：只认父票。可开的凭证只有三类，且都须能重放闭合：
+        #   父票自身暗码、被吞子票暗码、本父票名下仍有效的合并码（世代号）。
+        code = (pickup_code or "").strip()
         allowed_codes = {row["pickup_code"]} | group_pickup_codes(conn, ticket_no)
-        if (pickup_code or "").strip() not in allowed_codes:
-            raise HTTPException(403, "取衣暗码不符")
+        merge_codes = group_merge_codes(conn, ticket_no)
+        if code not in allowed_codes and code not in merge_codes:
+            # 若这是别组的合并码或差异未清的码，给出可核的拒绝理由。
+            try:
+                audit = resolve_merge_code(conn, code)
+            except HTTPException as e:
+                if e.status_code == 404:
+                    raise HTTPException(403, "取衣暗码不符")
+                raise
+            if audit["parent_ticket_no"] != ticket_no:
+                raise HTTPException(
+                    409,
+                    f"合并码属于「{audit['parent_ticket_no']}」，与本票「{ticket_no}」不符",
+                )
+            raise HTTPException(409, "合并码不可用")
         now = datetime.now().replace(microsecond=0).isoformat(sep=" ")
         conn.execute(
             "UPDATE hang_tickets SET status='已取', closed_at=? WHERE ticket_no=?",
@@ -206,7 +291,7 @@ def pickup(ticket_no: str, pickup_code: str, operator: str = "店员") -> dict:
         conn.execute(
             """INSERT INTO pickups(ticket_no, pickup_code, picked_at, operator)
                VALUES (?,?,?,?)""",
-            (ticket_no, (pickup_code or "").strip(), now, operator or "店员"),
+            (ticket_no, code, now, operator or "店员"),
         )
         conn.execute(
             """INSERT INTO process_events(ticket_no, from_status, to_status, operator, occurred_at, note)
@@ -215,13 +300,20 @@ def pickup(ticket_no: str, pickup_code: str, operator: str = "店员") -> dict:
         )
         # 取衣关账后，组内所有子票的票籍随父票归账（已在并票时关账，这里只补事件）。
         for link in conn.execute(
-            "SELECT child_ticket_no FROM merge_links WHERE parent_ticket_no=?",
+            "SELECT child_ticket_no, group_id FROM merge_links WHERE parent_ticket_no=?",
             (ticket_no,),
         ).fetchall():
             conn.execute(
                 """INSERT INTO process_events(ticket_no, from_status, to_status, operator, occurred_at, note)
                    VALUES (?,?,?,?,?,?)""",
-                (link["child_ticket_no"], None, "已并", operator or "店员", now, f"随父票 {ticket_no} 取衣关账"),
+                (
+                    link["child_ticket_no"],
+                    None,
+                    "已并",
+                    operator or "店员",
+                    now,
+                    f"随父票 {ticket_no} 取衣关账（世代 {link['group_id']}）",
+                ),
             )
         refresh_in_flight(conn)
     return get_ticket(ticket_no)
